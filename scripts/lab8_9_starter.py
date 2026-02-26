@@ -310,17 +310,16 @@ class ParticleFilter:
                     return False
             return True
 
-        log_weights = []
         for particle in self._particles:
             if not is_valid(particle.x, particle.y):
-                log_weights.append(-np.inf)
+                particle.log_p = -np.inf
                 continue
 
             expected_angle = angle_to_neg_pi_to_pi(particle.theta + scan_angle_in_rad)
             expected_distance = self._map.closest_distance((particle.x, particle.y), expected_angle)
 
-            if expected_distance is None or np.isinf(z):
-                log_weights.append(-np.inf)
+            if expected_distance is None or np.isinf(z) or np.isnan(z):
+                particle.log_p = -np.inf
                 continue
 
             log_likelihood = scipy.stats.norm(
@@ -329,40 +328,6 @@ class ParticleFilter:
             ).logpdf(z)
 
             particle.log_p += log_likelihood
-            log_weights.append(particle.log_p)
-
-        max_log_w = np.max(log_weights)
-        if np.isneginf(max_log_w):
-            uniform_log_p = math.log(1.0 / self._n_particles)
-            for particle in self._particles:
-                particle.log_p = uniform_log_p
-            return
-
-        weights = np.exp(np.array(log_weights) - max_log_w)
-        weights_sum = np.sum(weights)
-
-        if weights_sum <= 0 or np.isnan(weights_sum):
-            uniform_log_p = math.log(1.0 / self._n_particles)
-            for particle in self._particles:
-                particle.log_p = uniform_log_p
-            return
-
-        weights = weights / weights_sum
-
-        resampled_indices = np.random.choice(
-            len(self._particles),
-            size=self._n_particles,
-            replace=True,
-            p=weights
-        )
-
-        new_particles = []
-        uniform_log_p = math.log(1.0 / self._n_particles)
-        for idx in resampled_indices:
-            p = self._particles[idx]
-            new_particles.append(Particle(p.x, p.y, p.theta, uniform_log_p))
-
-        self._particles = new_particles
         ######### Your code ends here #########
 
     def get_estimate(self) -> Tuple[float, float, float]:
@@ -475,6 +440,59 @@ class Controller:
 
             self._particle_filter.measure(z, scan_angle)
 
+        log_ps = np.array([p.log_p for p in self._particle_filter._particles], dtype=np.float64)
+        max_log_p = np.max(log_ps)
+
+        if np.isneginf(max_log_p):
+            uniform_log_p = math.log(1.0 / len(self._particle_filter._particles))
+            for p in self._particle_filter._particles:
+                p.log_p = uniform_log_p
+        else:
+            weights = np.exp(log_ps - max_log_p)
+            weights_sum = np.sum(weights)
+
+            if weights_sum <= 0 or np.isnan(weights_sum):
+                weights = np.ones(len(self._particle_filter._particles), dtype=np.float64) / len(self._particle_filter._particles)
+            else:
+                weights = weights / weights_sum
+
+            old_particles = copy.deepcopy(self._particle_filter._particles)
+            indices = np.random.choice(
+                len(old_particles),
+                size=len(old_particles),
+                replace=True,
+                p=weights
+            )
+
+            x_min, x_max, y_min, y_max = self._particle_filter._map.map_aabb
+
+            def is_valid(x: float, y: float) -> bool:
+                if not (x_min <= x <= x_max and y_min <= y <= y_max):
+                    return False
+                for obs in self._particle_filter._map.obstacles:
+                    if obs[0] <= x <= obs[1] and obs[2] <= y <= obs[3]:
+                        return False
+                return True
+
+            new_particles = []
+            uniform_log_p = math.log(1.0 / len(old_particles))
+
+            for idx in indices:
+                p = old_particles[idx]
+
+                new_x = p.x + np.random.normal(0.0, 0.02)
+                new_y = p.y + np.random.normal(0.0, 0.02)
+                new_theta = angle_to_neg_pi_to_pi(p.theta + np.random.normal(0.0, 0.02))
+
+                if not is_valid(new_x, new_y):
+                    new_x = p.x
+                    new_y = p.y
+                    new_theta = p.theta
+
+                new_particles.append(Particle(new_x, new_y, new_theta, uniform_log_p))
+
+            self._particle_filter._particles = new_particles
+
         self._particle_filter.visualize_particles()
         self._particle_filter.visualize_estimate()
         ######### Your code ends here #########
@@ -490,25 +508,61 @@ class Controller:
         # Robot autonomously explores environment while it localizes itself
         ######### Your code starts here #########
         stable_count = 0
-        step_count = 0
-        rate = rospy.Rate(10)
 
-        while not rospy.is_shutdown():
-            front_idx = int(round((0.0 - self.laserscan.angle_min) / self.laserscan.angle_increment))
-            front_idx = max(0, min(front_idx, len(self.laserscan.ranges) - 1))
-            front_dist = self.laserscan.ranges[front_idx]
+        action_sequence = [
+            ("F", 0.15),
+            ("F", 0.15),
+            ("L", pi / 2.0),
+            ("F", 0.15),
+            ("F", 0.15),
+            ("R", pi / 2.0),
+            ("F", 0.15),
+            ("F", 0.15),
+            ("L", pi / 2.0),
+            ("F", 0.15),
+            ("F", 0.15),
+            ("L", pi / 2.0),
+            ("F", 0.15),
+            ("F", 0.15),
+            ("R", pi / 2.0),
+            ("F", 0.15),
+            ("F", 0.15),
+        ]
 
-            if front_dist == inf or np.isnan(front_dist):
-                front_dist = 10.0
+        self.take_measurements()
 
-            if front_dist < 0.4:
-                goal_theta = angle_to_neg_pi_to_pi(self.current_position["theta"] + pi / 2.0)
+        for step_idx, action in enumerate(action_sequence):
+            if rospy.is_shutdown():
+                break
+
+            act_type, value = action
+
+            # very simple wall-avoidance guard:
+            # before executing a forward action, check if there is enough clearance
+            if act_type == "F":
+                front_idx = int(round((0.0 - self.laserscan.angle_min) / self.laserscan.angle_increment))
+                front_idx = max(0, min(front_idx, len(self.laserscan.ranges) - 1))
+                front_dist = self.laserscan.ranges[front_idx]
+
+                if front_dist == inf or np.isnan(front_dist):
+                    front_dist = 10.0
+
+                # if too close to a wall, do a simple 90-degree turn instead
+                if front_dist < 0.30:
+                    goal_theta = angle_to_neg_pi_to_pi(self.current_position["theta"] + pi / 2.0)
+                    self.rotate_action(goal_theta)
+                else:
+                    self.forward_action(value)
+
+            elif act_type == "L":
+                goal_theta = angle_to_neg_pi_to_pi(self.current_position["theta"] + value)
                 self.rotate_action(goal_theta)
-            else:
-                self.forward_action(0.2)
+
+            elif act_type == "R":
+                goal_theta = angle_to_neg_pi_to_pi(self.current_position["theta"] - value)
+                self.rotate_action(goal_theta)
 
             self.take_measurements()
-            step_count += 1
 
             x_est, y_est, theta_est = self._particle_filter.get_estimate()
 
@@ -517,29 +571,29 @@ class Controller:
             thetas = np.array([p.theta for p in self._particle_filter._particles], dtype=np.float64)
 
             spread = np.sqrt(np.var(xs) + np.var(ys))
-            heading_consistency = np.sqrt(np.mean(np.sin(thetas))**2 + np.mean(np.cos(thetas))**2)
+            heading_consistency = np.sqrt(np.mean(np.sin(thetas)) ** 2 + np.mean(np.cos(thetas)) ** 2)
 
             distances = np.sqrt((xs - x_est) ** 2 + (ys - y_est) ** 2)
             cluster_ratio = np.mean(distances < 0.15)
 
             print(
-                f"[AUTO] step={step_count}, "
+                f"[AUTO] step={step_idx + 1}, "
+                f"est=({x_est:.3f}, {y_est:.3f}, {theta_est:.3f}), "
                 f"spread={spread:.4f}, "
                 f"heading={heading_consistency:.4f}, "
-                f"cluster_ratio={cluster_ratio:.4f}, "
-                f"estimate=({x_est:.3f}, {y_est:.3f}, {theta_est:.3f})"
+                f"cluster={cluster_ratio:.4f}"
             )
 
-            if spread < 0.06 and heading_consistency > 0.97 and cluster_ratio > 0.85:
+            # stronger confidence check:
+            # do not stop too early; require repeated stable convergence
+            if spread < 0.05 and heading_consistency > 0.98 and cluster_ratio > 0.90:
                 stable_count += 1
             else:
                 stable_count = 0
 
-            if step_count >= 5 and stable_count >= 3:
+            if stable_count >= 3:
                 rospy.loginfo("Particle filter converged. Stopping exploration.")
                 break
-
-            rate.sleep()
         ######### Your code ends here #########
 
     def forward_action(self, distance: float):
@@ -555,6 +609,10 @@ class Controller:
         direction = 1.0 if distance >= 0 else -1.0
         target_distance = abs(distance)
 
+        start_time = time()
+        prev_traveled = 0.0
+        stuck_count = 0
+
         while not rospy.is_shutdown():
             dx = self.current_position["x"] - start_x
             dy = self.current_position["y"] - start_y
@@ -562,6 +620,20 @@ class Controller:
             error = target_distance - traveled
 
             if error < 0.01:
+                break
+
+            if time() - start_time > 4.0:
+                print("[FORWARD] timeout, break")
+                break
+
+            if abs(traveled - prev_traveled) < 0.002:
+                stuck_count += 1
+            else:
+                stuck_count = 0
+            prev_traveled = traveled
+
+            if stuck_count > 15:
+                print("[FORWARD] robot seems stuck, break")
                 break
 
             now = time()
@@ -596,10 +668,28 @@ class Controller:
         rate = rospy.Rate(20)
         prev_time = time()
 
+        start_time = time()
+        prev_error_abs = None
+        stuck_count = 0
+
         while not rospy.is_shutdown():
             error = angle_to_neg_pi_to_pi(goal_theta - self.current_position["theta"])
 
-            if abs(error) < 0.02:
+            if abs(error) < 0.03:
+                break
+
+            if time() - start_time > 4.0:
+                print("[ROTATE] timeout, break")
+                break
+
+            if prev_error_abs is not None and abs(abs(error) - prev_error_abs) < 0.003:
+                stuck_count += 1
+            else:
+                stuck_count = 0
+            prev_error_abs = abs(error)
+
+            if stuck_count > 15:
+                print("[ROTATE] robot seems stuck, break")
                 break
 
             now = time()
@@ -623,7 +713,6 @@ class Controller:
         end_theta = self.current_position["theta"]
         delta_theta = angle_to_neg_pi_to_pi(end_theta - start_theta)
         self._particle_filter.move_by(0.0, 0.0, delta_theta)
-
         ######### Your code ends here #########
 
 
