@@ -489,17 +489,10 @@ class Controller:
         """
         # Robot autonomously explores environment while it localizes itself
         ######### Your code starts here #########
+        step_count = 0
         rate = rospy.Rate(10)
 
         while not rospy.is_shutdown():
-            xs = np.array([p.x for p in self._particle_filter._particles], dtype=np.float64)
-            ys = np.array([p.y for p in self._particle_filter._particles], dtype=np.float64)
-
-            spread = np.sqrt(np.var(xs) + np.var(ys))
-            if spread < 0.08:
-                rospy.loginfo("Particle filter converged. Stopping exploration.")
-                break
-
             front_idx = int(round((0.0 - self.laserscan.angle_min) / self.laserscan.angle_increment))
             front_idx = max(0, min(front_idx, len(self.laserscan.ranges) - 1))
             front_dist = self.laserscan.ranges[front_idx]
@@ -514,6 +507,21 @@ class Controller:
                 self.forward_action(0.2)
 
             self.take_measurements()
+            step_count += 1
+
+            xs = np.array([p.x for p in self._particle_filter._particles], dtype=np.float64)
+            ys = np.array([p.y for p in self._particle_filter._particles], dtype=np.float64)
+            thetas = np.array([p.theta for p in self._particle_filter._particles], dtype=np.float64)
+
+            spread = np.sqrt(np.var(xs) + np.var(ys))
+            heading_consistency = np.sqrt(np.mean(np.sin(thetas))**2 + np.mean(np.cos(thetas))**2)
+
+            print(f"[AUTO] step={step_count}, spread={spread:.4f}, heading={heading_consistency:.4f}")
+
+            if step_count >= 3 and spread < 0.08 and heading_consistency > 0.9:
+                rospy.loginfo("Particle filter converged. Stopping exploration.")
+                break
+
             rate.sleep()
         ######### Your code ends here #########
 
@@ -651,6 +659,8 @@ if __name__ == "__main__":
                 ######### Your code starts here #########
                 controller.forward_action(-0.25)
                 ######### Your code ends here #########
+            elif uinput == "q":
+                break
             else:
                 print("Invalid input")
             ######### Your code starts here #########
