@@ -489,6 +489,7 @@ class Controller:
         """
         # Robot autonomously explores environment while it localizes itself
         ######### Your code starts here #########
+        stable_count = 0
         step_count = 0
         rate = rospy.Rate(10)
 
@@ -509,6 +510,8 @@ class Controller:
             self.take_measurements()
             step_count += 1
 
+            x_est, y_est, theta_est = self._particle_filter.get_estimate()
+
             xs = np.array([p.x for p in self._particle_filter._particles], dtype=np.float64)
             ys = np.array([p.y for p in self._particle_filter._particles], dtype=np.float64)
             thetas = np.array([p.theta for p in self._particle_filter._particles], dtype=np.float64)
@@ -516,9 +519,23 @@ class Controller:
             spread = np.sqrt(np.var(xs) + np.var(ys))
             heading_consistency = np.sqrt(np.mean(np.sin(thetas))**2 + np.mean(np.cos(thetas))**2)
 
-            print(f"[AUTO] step={step_count}, spread={spread:.4f}, heading={heading_consistency:.4f}")
+            distances = np.sqrt((xs - x_est) ** 2 + (ys - y_est) ** 2)
+            cluster_ratio = np.mean(distances < 0.15)
 
-            if step_count >= 3 and spread < 0.08 and heading_consistency > 0.9:
+            print(
+                f"[AUTO] step={step_count}, "
+                f"spread={spread:.4f}, "
+                f"heading={heading_consistency:.4f}, "
+                f"cluster_ratio={cluster_ratio:.4f}, "
+                f"estimate=({x_est:.3f}, {y_est:.3f}, {theta_est:.3f})"
+            )
+
+            if spread < 0.06 and heading_consistency > 0.97 and cluster_ratio > 0.85:
+                stable_count += 1
+            else:
+                stable_count = 0
+
+            if step_count >= 5 and stable_count >= 3:
                 rospy.loginfo("Particle filter converged. Stopping exploration.")
                 break
 
